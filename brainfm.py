@@ -2,7 +2,8 @@ import sys
 import argparse
 import numpy as np
 from pydub import AudioSegment
-from pydub.effects import normalize, low_pass_filter
+from pydub.effects import normalize, low_pass_filter, high_pass_filter
+from pydub.generators import WhiteNoise
 
 def apply_reverb(audio, reverb_amount):
     """Apply a simple reverb effect to the audio."""
@@ -62,7 +63,108 @@ def soften_transients(audio, amount):
     # Normalize to avoid clipping
     return normalize(result)
 
-def apply_brainfm_modulation(mp3_path, output_path, mod_freq=17.0, depth=0.35, tempo=1.0, reverb=0, soften=0):
+def add_pink_noise(audio, noise_db):
+    """
+    Overlay low‑level pink‑style noise under the whole track.
+    `noise_db` should be a negative number (e.g. -32). 0 disables the layer.
+    """
+    if noise_db is None or noise_db >= 0:
+        return audio
+
+    print(f"Adding pink noise bed at {noise_db} dBFS")
+    # Pydub has WhiteNoise; approximate pink by low‑passing it.
+    noise = WhiteNoise().to_audio_segment(duration=len(audio)).low_pass_filter(8000)
+    noise = noise.apply_gain(noise_db)  # set level
+    return audio.overlay(noise)
+
+def band_pass_filter(audio, low_cutoff, high_cutoff):
+    """Return a simple band‑pass (high‑pass then low‑pass)."""
+    bp = high_pass_filter(audio, low_cutoff)
+    bp = low_pass_filter(bp, high_cutoff)
+    return bp
+
+def _amp_modulate(samples, sr, freq, depth):
+    """Amplitude‑modulate a numpy sample array in‑place."""
+    if depth <= 0:
+        return samples
+    t = np.arange(samples.shape[1]) / sr
+    env = 1.0 + depth * np.sin(2 * np.pi * freq * t)
+    env = np.tile(env, (samples.shape[0], 1))
+    return samples * env
+
+def multiband_modulate(audio, mod_freq, depth):
+    """
+    Apply Brain.fm‑style multi‑band modulation:
+      • sub (<120 Hz): shallow, ≤8 Hz
+      • low‑mid (120‑500 Hz): moderate at mod_freq
+      • high‑mid (500‑4 kHz): strongest at mod_freq
+      • air (>4 kHz): very light
+    """
+    sr  = audio.frame_rate
+    sw  = audio.sample_width
+    ch  = audio.channels
+
+    # Split bands
+    sub      = low_pass_filter(audio, 120)
+    low_mid  = band_pass_filter(audio, 120, 500)
+    high_mid = band_pass_filter(audio, 500, 4000)
+    air      = high_pass_filter(audio, 4000)
+
+    def seg2np(seg):
+        arr = np.array(seg.get_array_of_samples()).astype(np.float32)
+        return arr.reshape((-1, ch)).T if ch == 2 else arr[np.newaxis, :]
+
+    def np2seg(arr, template):
+        if ch == 2:
+            arr = arr.T.reshape((-1,))
+        else:
+            arr = arr.reshape((-1,))
+        return template._spawn(arr.astype(np.int16).tobytes())
+
+    # Process each band
+    sub_mod      = _amp_modulate(seg2np(sub),      sr, min(mod_freq, 8),  min(depth * 0.4, 0.10))
+    low_mid_mod  = _amp_modulate(seg2np(low_mid),  sr, mod_freq,          max(0.15, depth * 0.7))
+    high_mid_mod = _amp_modulate(seg2np(high_mid), sr, mod_freq,          depth)
+    air_mod      = _amp_modulate(seg2np(air),      sr, mod_freq,          min(depth * 0.3, 0.10))
+
+    # Convert back to AudioSegments
+    sub_seg      = np2seg(sub_mod, sub)
+    low_mid_seg  = np2seg(low_mid_mod, low_mid)
+    high_mid_seg = np2seg(high_mid_mod, high_mid)
+    air_seg      = np2seg(air_mod, air)
+
+    # Mix bands and normalise
+    combined = sub_seg.overlay(low_mid_seg).overlay(high_mid_seg).overlay(air_seg)
+    return normalize(combined)
+
+def apply_autopan(samples, sample_rate, pan_rate):
+    """Apply a stereo autopan effect that slowly shifts audio between channels.
+    
+    Args:
+        samples: numpy array of shape [channels, samples]
+        sample_rate: audio sample rate in Hz
+        pan_rate: frequency of the autopan in Hz (0 disables the effect)
+    """
+    if pan_rate <= 0 or samples.shape[0] < 2:
+        return samples  # Do nothing if pan_rate is 0 or mono audio
+        
+    # Create a panning envelope that oscillates between -1 and 1
+    t = np.arange(samples.shape[1]) / sample_rate
+    pan_envelope = np.sin(2 * np.pi * pan_rate * t)
+    
+    # Apply panning
+    left_gain = (1 + pan_envelope) / 2  # Ranges from 0 to 1
+    right_gain = (1 - pan_envelope) / 2  # Opposite of left
+    
+    # Apply gains to channels
+    samples[0, :] *= left_gain  # Left channel
+    samples[1, :] *= right_gain  # Right channel
+    
+    return samples
+
+def apply_brainfm_modulation(mp3_path, output_path, mod_freq=17.0, depth=0.35,
+                             tempo=1.0, reverb=0, soften=0,
+                             pan_rate=0.0, noise_db=None, multiband=False):
     print(f"Processing: {mp3_path}")
     audio = AudioSegment.from_file(mp3_path)
     
@@ -84,6 +186,11 @@ def apply_brainfm_modulation(mp3_path, output_path, mod_freq=17.0, depth=0.35, t
     if soften > 0:
         audio = soften_transients(audio, soften)
     
+    # --- optional multiband modulation ---
+    if multiband:
+        audio = multiband_modulate(audio, mod_freq, depth)
+        # depth is already "spent"; skip single‑band envelope later
+
     sample_rate = audio.frame_rate
     sample_width = audio.sample_width
     channels = audio.channels
@@ -94,13 +201,20 @@ def apply_brainfm_modulation(mp3_path, output_path, mod_freq=17.0, depth=0.35, t
     else:
         samples = samples[np.newaxis, :]  # shape: [1, n]
 
-    # Create modulation envelope
-    t = np.arange(samples.shape[1]) / sample_rate
-    envelope = 1.0 + depth * np.sin(2 * np.pi * mod_freq * t)
-    envelope = np.tile(envelope, (channels, 1))  # same envelope for both channels
+    if not multiband:
+        t = np.arange(samples.shape[1]) / sample_rate
+        envelope = 1.0 + depth * np.sin(2 * np.pi * mod_freq * t)
+        envelope = np.tile(envelope, (channels, 1))  # same envelope for both channels
 
-    # Apply modulation
-    modulated = samples * envelope
+        # Apply modulation
+        modulated = samples * envelope
+    else:
+        modulated = samples
+
+    # Optional slow stereo autopan
+    apply_autopan(samples, sample_rate, pan_rate)
+
+    # Convert back to AudioSegment so we can overlay noise later
 
     # Clip to int16 range
     max_val = float(2 ** (8 * sample_width - 1) - 1)
@@ -114,6 +228,10 @@ def apply_brainfm_modulation(mp3_path, output_path, mod_freq=17.0, depth=0.35, t
 
     # Create AudioSegment from modulated samples
     modulated_audio = audio._spawn(modulated.tobytes())
+
+    # Add pink/brown noise bed if requested
+    modulated_audio = add_pink_noise(modulated_audio, noise_db)
+
     modulated_audio.export(output_path, format="mp3")
     print(f"✅ Done: {output_path}")
 
@@ -132,6 +250,12 @@ if __name__ == "__main__":
                         help="Modulation frequency in Hz (default: 17.0)")
     parser.add_argument("--depth", type=float, default=0.35,
                         help="Modulation depth (default: 0.35)")
+    parser.add_argument("--pan-rate", type=float, default=0.0,
+                        help="Slow autopan rate in Hz (0 disables, e.g. 0.2)")
+    parser.add_argument("--noise-db", type=float, default=None,
+                        help="Level (dBFS) of pink noise bed (negative value, e.g. -32; omit to disable)")
+    parser.add_argument("--multiband", action="store_true",
+                        help="Enable multi‑band Brain.fm‑style modulation")
     
     args = parser.parse_args()
     
@@ -142,5 +266,8 @@ if __name__ == "__main__":
         depth=args.depth,
         tempo=args.tempo,
         reverb=args.reverb,
-        soften=args.soften
+        soften=args.soften,
+        pan_rate=args.pan_rate,
+        noise_db=args.noise_db,
+        multiband=args.multiband
     )
