@@ -137,28 +137,30 @@ def multiband_modulate(audio, mod_freq, depth):
     combined = sub_seg.overlay(low_mid_seg).overlay(high_mid_seg).overlay(air_seg)
     return normalize(combined)
 
-def apply_autopan(samples, sample_rate, pan_rate):
+def apply_autopan(samples, sample_rate, pan_rate, pan_depth=0.5):
     """Apply a stereo autopan effect that slowly shifts audio between channels.
     
     Args:
         samples: numpy array of shape [channels, samples]
         sample_rate: audio sample rate in Hz
         pan_rate: frequency of the autopan in Hz (0 disables the effect)
+        pan_depth: controls how extreme the panning gets (0-1, default 0.8)
     """
     if pan_rate <= 0 or samples.shape[0] < 2:
-        return samples  # Do nothing if pan_rate is 0 or mono audio
+        return samples
         
     # Create a panning envelope that oscillates between -1 and 1
     t = np.arange(samples.shape[1]) / sample_rate
-    pan_envelope = np.sin(2 * np.pi * pan_rate * t)
+    # Scale down the envelope by pan_depth to limit range
+    pan_envelope = pan_depth * np.sin(2 * np.pi * pan_rate * t)
     
     # Apply panning
-    left_gain = (1 + pan_envelope) / 2  # Ranges from 0 to 1
+    left_gain = (1 + pan_envelope) / 2  # Now ranges from (1-depth)/2 to (1+depth)/2
     right_gain = (1 - pan_envelope) / 2  # Opposite of left
     
     # Apply gains to channels
-    samples[0, :] *= left_gain  # Left channel
-    samples[1, :] *= right_gain  # Right channel
+    samples[0, :] *= left_gain
+    samples[1, :] *= right_gain
     
     return samples
 
