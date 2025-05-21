@@ -8,8 +8,8 @@ import gc
 import tempfile
 import os
 
-# Chunk size for processing (10 seconds)
-CHUNK_SIZE_MS = 10000
+
+CHUNK_SIZE_MS = 60000
 
 def apply_reverb(audio, reverb_amount):
     """Apply a simple reverb effect to the audio."""
@@ -338,7 +338,7 @@ if __name__ == "__main__":
                         help="Level (dBFS) of pink noise bed (negative value, e.g. -32; omit to disable)")
     parser.add_argument("--multiband", action="store_true",
                         help="Enable multi‑band Brain.fm‑style modulation")
-    parser.add_argument("--chunk-size", type=int, default=10000,
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE_MS,
                         help="Size of audio chunks to process in milliseconds (default: 10000)")
     
     args = parser.parse_args()

@@ -1,4 +1,4 @@
-venvkrow@Youssefs-MacBook-Pro brainfm % python brainfm.py viking2.mp3 viking2_mb.mp3 \
+venvkrow@Youssefs-MacBook-Pro brainfm % python brainfm.py universelo.mp3 universelo_mb.mp3 \
   --tempo 0.75 \
   --multiband \
   --mod-freq 18 \
@@ -16,7 +16,7 @@ Adding pink noise bed at -64.0 dBFS
 python brainfm.py templar.mp3 templar__theta.mp3 \
   --tempo 0.75 \
   --multiband \
-  --mod-freq 6 \
-  --depth 0.38 \
+  --mod-freq 1 \
+  --depth 0.30 \
   --pan-rate 0.1 \
   --noise-db -128
