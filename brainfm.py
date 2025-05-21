@@ -5,8 +5,8 @@ from pydub import AudioSegment
 from pydub.effects import normalize, low_pass_filter, high_pass_filter
 from pydub.generators import WhiteNoise
 import gc
-import tempfile
 import os
+from concurrent.futures import ProcessPoolExecutor
 
 
 CHUNK_SIZE_MS = 60000
@@ -99,6 +99,37 @@ def _amp_modulate(samples, sr, freq, depth):
     # Modify samples in-place to save memory
     samples *= env
     return samples
+
+
+# Helper for multiprocessing
+def _process_chunk(args):
+    """
+    Helper for multiprocessing. Re‑creates an AudioSegment from raw bytes,
+    runs `process_audio_chunk`, and returns a tuple (index, raw_bytes).
+    """
+    (index,
+     raw_data,
+     frame_rate,
+     sample_width,
+     channels,
+     mod_freq,
+     depth,
+     reverb,
+     soften,
+     pan_rate,
+     noise_db,
+     multiband) = args
+
+    chunk = AudioSegment(
+        data=raw_data,
+        sample_width=sample_width,
+        frame_rate=frame_rate,
+        channels=channels
+    )
+
+    processed = process_audio_chunk(chunk, mod_freq, depth, reverb,
+                                    soften, pan_rate, noise_db, multiband)
+    return index, processed.raw_data
 
 def multiband_modulate(audio, mod_freq, depth):
     """
@@ -256,63 +287,77 @@ def apply_brainfm_modulation(mp3_path, output_path, mod_freq=17.0, depth=0.35,
         info = AudioSegment.from_file(mp3_path, duration=100).set_sample_width(2)
         sample_rate = info.frame_rate
         channels = info.channels
-        
+
         # Apply tempo change to frame rate if needed
         if tempo != 1.0:
             print(f"Adjusting tempo: {tempo}x")
             target_rate = int(sample_rate * tempo)
         else:
             target_rate = sample_rate
-        
-        # Create a temporary directory for processed chunks
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Check if the output directory exists
-            output_dir = os.path.dirname(output_path)
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-                
-            # Process the file in chunks
-            input_audio = AudioSegment.from_file(mp3_path)
-            total_length = len(input_audio)
-            chunks = []
-            
-            for i in range(0, total_length, CHUNK_SIZE_MS):
-                print(f"Processing chunk {i//CHUNK_SIZE_MS + 1}/{(total_length+CHUNK_SIZE_MS-1)//CHUNK_SIZE_MS}...")
-                # Extract chunk
-                end = min(i + CHUNK_SIZE_MS, total_length)
-                chunk = input_audio[i:end]
-                
-                # Apply tempo change at chunk level
-                if tempo != 1.0:
-                    chunk = chunk._spawn(chunk.raw_data, overrides={"frame_rate": target_rate})
-                    chunk = chunk.set_frame_rate(sample_rate)
-                
-                # Process this chunk
-                processed_chunk = process_audio_chunk(chunk, mod_freq, depth, reverb, 
-                                                    soften, pan_rate, noise_db, multiband)
-                
-                # Save processed chunk to temporary file
-                chunk_path = os.path.join(temp_dir, f"chunk_{i}.wav")
-                processed_chunk.export(chunk_path, format="wav")
-                chunks.append(chunk_path)
-                
-                # Free memory
-                del chunk, processed_chunk
-                gc.collect()
-            
-            # Combine all processed chunks
-            print("Combining processed chunks...")
-            combined = AudioSegment.empty()
-            for chunk_path in chunks:
-                chunk = AudioSegment.from_file(chunk_path)
-                combined += chunk
-                del chunk
-                gc.collect()
-            
-            # Export final combined audio
-            combined.export(output_path, format="mp3")
-            print(f"✅ Done: {output_path}")
-    
+
+        # Ensure the output directory exists
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # Split into chunks and prepare argument list for workers
+        input_audio = AudioSegment.from_file(mp3_path)
+        total_length = len(input_audio)
+        tasks = []
+
+        for i in range(0, total_length, CHUNK_SIZE_MS):
+            print(f"Queueing chunk {i // CHUNK_SIZE_MS + 1}/{(total_length + CHUNK_SIZE_MS - 1) // CHUNK_SIZE_MS}...")
+            end = min(i + CHUNK_SIZE_MS, total_length)
+            chunk = input_audio[i:end]
+
+            # Apply tempo change at chunk level
+            if tempo != 1.0:
+                chunk = chunk._spawn(chunk.raw_data, overrides={"frame_rate": target_rate})
+                chunk = chunk.set_frame_rate(sample_rate)
+
+            # Build task tuple (index first to preserve order)
+            tasks.append((
+                i // CHUNK_SIZE_MS,
+                chunk.raw_data,
+                sample_rate,
+                chunk.sample_width,
+                chunk.channels,
+                mod_freq,
+                depth,
+                reverb,
+                soften,
+                pan_rate,
+                noise_db,
+                multiband
+            ))
+
+            del chunk
+            gc.collect()
+
+        # Process chunks in parallel across all CPU cores
+        print("Processing chunks in parallel...")
+        results = {}
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            for idx, raw in executor.map(_process_chunk, tasks):
+                results[idx] = raw
+
+        # Combine all processed chunks
+        combined = AudioSegment.empty()
+        for idx in sorted(results.keys()):
+            seg = AudioSegment(
+                data=results[idx],
+                sample_width=info.sample_width,
+                frame_rate=sample_rate,
+                channels=channels
+            )
+            combined += seg
+            del seg
+            gc.collect()
+
+        # Export final combined audio
+        combined.export(output_path, format="mp3")
+        print(f"✅ Done: {output_path}")
+
     except Exception as e:
         print(f"Error processing audio: {e}")
         sys.exit(1)
